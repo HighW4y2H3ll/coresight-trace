@@ -326,11 +326,11 @@ int disable_trace(const struct board *board, struct cs_devices_t *devices)
   return 0;
 }
 
-int enable_trace_sinks_only(struct cs_devices_t *devices)
+int enable_trace_sinks_only(const struct board *board, struct cs_devices_t *devices)
 {
-  int error_count;
+  int i, error_count;
 
-  if (!devices) {
+  if (!board || !devices) {
     return -1;
   }
 
@@ -351,6 +351,9 @@ int enable_trace_sinks_only(struct cs_devices_t *devices)
     }
   }
 
+  for (i = 0; i < board->n_cpu; ++i) {
+    cs_etm_disable_programming(devices->ptm[i]);
+  }
   cs_checkpoint();
 
   error_count = cs_error_count();
@@ -362,16 +365,19 @@ int enable_trace_sinks_only(struct cs_devices_t *devices)
   return 0;
 }
 
-int disable_trace_sinks_only(struct cs_devices_t *devices)
+int disable_trace_sinks_only(const struct board *board, struct cs_devices_t *devices)
 {
-  int error_count;
+  int i, error_count;
 
-  if (!devices) {
+  if (!board || !devices) {
     return -1;
   }
 
   cs_etb_flush_and_wait_stop(devices);
 
+  for (i = 0; i < board->n_cpu; ++i) {
+    cs_etm_enable_programming(devices->ptm[i]);
+  }
   if (devices->trace_sinks[0]) {
     cs_sink_disable(devices->trace_sinks[0]);
   }
