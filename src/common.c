@@ -129,6 +129,9 @@ static void wait_trace_event(trace_event_t event)
   }
   pthread_mutex_unlock(&trace_event_mutex);
 }
+void wait_resume_event() {
+    wait_trace_event(resume_event);
+}
 
 static void set_trace_state(trace_state_t new_state)
 {
@@ -154,6 +157,49 @@ static void set_trace_state(trace_state_t new_state)
             new_state);
   }
   pthread_mutex_unlock(&trace_state_mutex);
+}
+
+static int trace_sink_polling_raw(unsigned long decoding_threshold)
+{
+  int ret;
+  unsigned long init_pos;
+  unsigned long curr_offset;
+
+  ret = 0;
+  init_pos = cs_get_buffer_rwp(devices.etb);
+
+  while (!kill(child_pid, 0)) {
+    curr_offset = cs_get_buffer_rwp(devices.etb) - init_pos;
+    if (curr_offset > decoding_threshold) {
+      /* Suspend child_pid process. */
+      ret = kill(child_pid, SIGSTOP);
+      if (ret < 0) {
+        if (errno == ESRCH) {
+          /* child_pid killed. */
+          goto exit;
+        }
+        perror("kill");
+        goto exit;
+      }
+
+      /* Wait for suspending trace. */
+      wait_trace_event(suspend_event);
+
+      if ((ret = disable_cs_trace(false)) < 0) {
+        fprintf(stderr, "disable_cs_trace() failed\n");
+        //goto exit;
+      }
+      fetch_trace();
+
+      enable_cs_trace(child_pid);
+      /* Continue child_pid process. */
+      set_trace_state(running_state);
+      break;
+    }
+  }
+
+exit:
+  return ret;
 }
 
 static int trace_sink_polling(unsigned long decoding_threshold)
@@ -233,6 +279,45 @@ exit:
   pthread_mutex_unlock(&trace_decoder_mutex);
 
   return ret;
+}
+
+static void *poll_worker(void *arg)
+{
+  trace_event_t event;
+  size_t etf_ram_size;
+  unsigned long decoding_threshold;
+
+  if (etr_ram_size == 0) {
+    etr_ram_size = cs_get_buffer_size_bytes(devices.etb);
+  }
+  if (devices.trace_sinks[0]) {
+    etf_ram_size = (size_t)cs_get_buffer_size_bytes(devices.trace_sinks[0]);
+    if (etf_ram_size < etr_ram_size) {
+      decoding_threshold = etf_ram_size;
+    } else {
+      decoding_threshold = etr_ram_size;
+    }
+  } else {
+    decoding_threshold = etr_ram_size;
+  }
+
+  while (1) {
+    pthread_mutex_lock(&trace_event_mutex);
+    while (trace_event != start_event \
+            && trace_event != fini_event \
+            && trace_event != resume_event) {
+      pthread_cond_wait(&trace_event_cond, &trace_event_mutex);
+    }
+    event = trace_event; /* TODO: trace_event can be changed in if cond. */
+    pthread_mutex_unlock(&trace_event_mutex);
+    if (event == fini_event) {
+        break;
+    } else {
+        // TODO: tune threshold to avoid FIFO overflow (maybe?)
+        trace_sink_polling_raw(decoding_threshold);
+    }
+  }
+  return NULL;
 }
 
 static void *decoder_worker(void *arg)
@@ -499,7 +584,7 @@ static int enable_cs_trace(pid_t pid)
     is_first_trace = false;
   } else {
     /* Enable trace sinks only once ETMs enabled */
-    if (enable_trace_sinks_only(&devices) < 0) {
+    if (enable_trace_sinks_only(board, &devices) < 0) {
       fprintf(stderr, "enable_trace_sinks_only() failed\n");
       goto exit;
     }
@@ -534,7 +619,7 @@ static int disable_cs_trace(bool disable_all)
         fprintf(stderr, "disable_trace() failed\n");
       }
     } else {
-      if ((ret = disable_trace_sinks_only(&devices)) < 0) {
+      if ((ret = disable_trace_sinks_only(board, &devices)) < 0) {
         fprintf(stderr, "disable_trace_sinks_only() failed\n");
       }
     }
@@ -745,18 +830,25 @@ int init_trace(pid_t parent_pid, pid_t pid)
       fprintf(stderr, "pthread_create() failed: %d\n", ret);
       goto exit;
     }
-
-    /* Using find_free_cpu() for decoder thread decreases performance on
-     * Marvell ThunderX2. The tracee process and the decoder thread should be
-     * in the same CPU core group. DEFAULT_DECODER_CPU fallback is -1.
-     */
-    if ((decoder_cpu = get_preferred_cpu(pid)) < 0) {
-      decoder_cpu = DEFAULT_DECODER_CPU;
+  } else {
+    // Explicit thread to poll and drain FIFO
+    ret = pthread_create(&decoder_thread, NULL, poll_worker, NULL);
+    if (ret != 0) {
+      fprintf(stderr, "pthread_create() failed: %d\n", ret);
+      goto exit;
     }
-    if (decoder_cpu >= 0) {
-      if (set_pthread_cpu_affinity(decoder_cpu, decoder_thread) < 0) {
-        fprintf(stderr, "set_pthread_cpu_affinity() failed");
-      }
+  }
+
+  /* Using find_free_cpu() for decoder thread decreases performance on
+   * Marvell ThunderX2. The tracee process and the decoder thread should be
+   * in the same CPU core group. DEFAULT_DECODER_CPU fallback is -1.
+   */
+  if ((decoder_cpu = get_preferred_cpu(pid)) < 0) {
+    decoder_cpu = DEFAULT_DECODER_CPU;
+  }
+  if (decoder_cpu >= 0) {
+    if (set_pthread_cpu_affinity(decoder_cpu, decoder_thread) < 0) {
+      fprintf(stderr, "set_pthread_cpu_affinity() failed");
     }
   }
 
@@ -779,6 +871,8 @@ void fini_trace(void)
     set_trace_state(fini_state);
     pthread_join(decoder_thread, NULL);
   } else {
+    set_trace_state(fini_state);
+    pthread_join(decoder_thread, NULL);
     fetch_trace();
   }
 

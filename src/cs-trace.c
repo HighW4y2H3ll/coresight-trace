@@ -60,23 +60,28 @@ void child(char *argv[])
 
 void parent(pid_t pid, int *child_status)
 {
-  int wstatus;
+  int ret, wstatus;
 
-  waitpid(pid, &wstatus, 0);
+  ptrace(PTRACE_ATTACH, pid, NULL, NULL);
+  ret = waitpid(pid, &wstatus, 0);
   if (WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) == PTRACE_EVENT_VFORK_DONE) {
     init_trace(getpid(), pid);
     start_trace(pid, true);
-    ptrace(PTRACE_CONT, pid, NULL, NULL);
+    if (ptrace(PTRACE_CONT, pid, NULL, NULL) < 0)
+      perror("PTRACE CONT error");
   }
 
   while (1) {
-    waitpid(pid, &wstatus, 0);
+    ret = waitpid(pid, &wstatus, WUNTRACED);
     if (WIFEXITED(wstatus)) {
       stop_trace(true);
       fini_trace();
       break;
     } else if (WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) == SIGSTOP) {
       trace_suspend_resume_callback();
+      wait_resume_event();
+      if (ptrace(PTRACE_CONT, pid, NULL, SIGCONT) < 0)
+        perror("Resume with PTRACE CONT failed\n");
     }
   }
 
